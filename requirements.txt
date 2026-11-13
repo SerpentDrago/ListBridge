@@ -1,0 +1,7 @@
+gkeepapi>=0.17.1
+pyanylist>=0.0.6
+requests>=2.31.0
+aiohttp>=3.9.0
+aioamazondevices>=17.2.3
+pyalexatodo==0.2.0
+pyotp>=2.9.0
