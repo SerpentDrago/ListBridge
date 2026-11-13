@@ -1,18 +1,13 @@
 import os
+import re
 import sys
+import site
 import time
 import json
-import asyncio
-import inspect
 import logging
 import traceback
-import gkeepapi
-from aiohttp import ClientSession
-from aioamazondevices.api import AmazonEchoApi
-from pyalexatodo.api import AlexaToDoAPI
-from pyanylist import AnyListClient
 
-# Support /data (standard Docker volume) or fallback to /app for legacy mounts
+# 1. Configure logging on Line 1 BEFORE any third-party imports so crashes are ALWAYS logged to sync.log
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.exists("/data") else "/app")
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -28,6 +23,57 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+def patch_pyalexatodo_cleanly():
+    """
+    Safely patches pyalexatodo 0.2.0 typing bugs in site-packages (or /app/libs)
+    by reading the full file into memory BEFORE opening for write.
+    """
+    search_dirs = [ "/app/libs" ] + site.getsitepackages()
+    for base_dir in search_dirs:
+        pkg_dir = os.path.join(base_dir, "pyalexatodo")
+        if not os.path.exists(pkg_dir):
+            continue
+        for root, _, files in os.walk(pkg_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, "r", encoding="utf-8") as f:
+                    code = f.read()
+
+                if "AlexaToDoAPI" not in code and fname == "api.py":
+                    logging.error(f"Corrupted {fpath} detected!")
+                    continue
+
+                lines = [
+                    ln for ln in code.splitlines()
+                    if ln.strip() not in ("from __future__ import annotations", "import typing", "import builtins")
+                ]
+                clean_code = "\n".join(lines)
+                clean_code = clean_code.replace("ListInfo[ListInfo]", "typing.List[ListInfo]")
+                clean_code = clean_code.replace("builtins.list[", "typing.List[")
+                clean_code = re.sub(r"(?<![\w\.])list\[", "typing.List[", clean_code)
+
+                patched_code = "from __future__ import annotations\nimport typing\n" + clean_code + "\n"
+                compile(patched_code, fpath, "exec")
+                with open(fpath, "w", encoding="utf-8") as f:
+                    f.write(patched_code)
+
+try:
+    patch_pyalexatodo_cleanly()
+    import asyncio
+    import inspect
+    import requests
+    import gkeepapi
+    from aiohttp import ClientSession
+    from aioamazondevices.api import AmazonEchoApi
+    from pyalexatodo.api import AlexaToDoAPI
+    from pyanylist import AnyListClient
+except Exception as boot_err:
+    logging.error(f"STARTUP ERROR: {boot_err}\n{traceback.format_exc()}")
+    time.sleep(60)
+    sys.exit(1)
 
 logging.getLogger("gkeepapi").setLevel(logging.ERROR)
 logging.getLogger("aioamazondevices").setLevel(logging.WARNING)
