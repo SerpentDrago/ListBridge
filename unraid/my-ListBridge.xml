@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>ListBridge</Name>
+  <Repository>ghcr.io/serpentdrago/listbridge:latest</Repository>
+  <Registry>https://github.com/SerpentDrago/ListBridge/pkgs/container/listbridge</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/SerpentDrago/ListBridge/issues</Support>
+  <Project>https://github.com/SerpentDrago/ListBridge</Project>
+  <Overview>ListBridge: 3-Way synchronization daemon between AnyList, Google Keep, and Amazon Alexa lists. Synchronizes item additions, cross-offs/checkmarks (preserving crossed-off history), unchecks, and deletions across one or multiple lists.</Overview>
+  <Category>Tools:Productivity</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/SerpentDrago/ListBridge/main/unraid/my-ListBridge.xml</TemplateURL>
+  <Icon>https://api.iconify.design/mdi/clipboard-sync.svg?color=%2300b0ff&amp;width=256</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="AppData Storage Path" Target="/data" Default="/mnt/user/appdata/anylist-keep-sync" Mode="rw" Description="Persistent storage directory for state.json, alexa_auth.json, and sync.log" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/anylist-keep-sync</Config>
+  <Config Name="List Names" Target="LIST_NAMES" Default="Grocery" Mode="" Description="Comma-separated list of list names to sync across AnyList, Google Keep, and Alexa (e.g., Grocery,Hardware,Costco)" Type="Variable" Display="always" Required="true" Mask="false">Grocery</Config>
+  <Config Name="Sync Interval (Seconds)" Target="SYNC_INTERVAL" Default="60" Mode="" Description="Time in seconds between sync cycles (Recommended: 60)" Type="Variable" Display="always" Required="true" Mask="false">60</Config>
+  <Config Name="AnyList Email" Target="ANYLIST_EMAIL" Default="" Mode="" Description="Your AnyList account email address" Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="AnyList Password" Target="ANYLIST_PASSWORD" Default="" Mode="" Description="Your AnyList account password" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Google Keep Email" Target="GKEEP_EMAIL" Default="" Mode="" Description="Your Google account email address" Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Google Keep Master Token / App Password" Target="GKEEP_APP_PASSWORD" Default="" Mode="" Description="Your Google Keep OAuth Master Token (aas_et/...) or App Password" Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Amazon Alexa Email" Target="ALEXA_EMAIL" Default="" Mode="" Description="Your Amazon account email address (Leave blank to run 2-way AnyList/Keep sync only)" Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Amazon Alexa Password" Target="ALEXA_PASSWORD" Default="" Mode="" Description="Your Amazon account password" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Amazon Alexa 2FA OTP Secret" Target="ALEXA_OTP_SECRET" Default="" Mode="" Description="Your Amazon 2FA Authenticator Base32 Secret Key (used to automatically generate 6-digit TOTP codes when refreshing session tokens)" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Alexa List Name Mapping (Optional)" Target="ALEXA_LIST_MAP" Default="" Mode="" Description="Optional mapping if a list has a different name in Alexa (Format: AnyListName:AlexaName, e.g., Groceries:Shop). Leave blank when list names match 1-to-1." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Internal Data Directory" Target="DATA_DIR" Default="/data" Mode="" Description="Internal container path for state and auth files" Type="Variable" Display="advanced" Required="false" Mask="false">/data</Config>
+</Container>

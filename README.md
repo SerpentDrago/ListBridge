@@ -1,6 +1,9 @@
-# AnyList <-> Google Keep <-> Amazon Alexa (3-Way List Sync)
+# ListBridge (AnyList <-> Google Keep <-> Amazon Alexa 3-Way Sync)
 
 A lightweight, self-contained Docker daemon that maintains real-time 3-way synchronization between **AnyList**, **Google Keep**, and **Amazon Alexa** lists.
+
+- **GitHub Repository:** [https://github.com/SerpentDrago/ListBridge](https://github.com/SerpentDrago/ListBridge)
+- **Docker Image:** `ghcr.io/serpentdrago/listbridge:latest`
 
 ## Features
 - **True 3-Way Sync:** Syncs item additions, checkmarks/cross-offs, unchecks, and deletions across all three services.
@@ -27,6 +30,6 @@ A lightweight, self-contained Docker daemon that maintains real-time 3-way synch
 
 ## Unraid Installation
 
-1. Copy `unraid/my-anylist-keep-alexa-sync.xml` to `/boot/config/plugins/dockerMan/templates-user/my-anylist-keep-alexa-sync.xml` on your Unraid server.
-2. In the Unraid WebGUI, go to **Docker** -> **Add Container** -> select **anylist-keep-alexa-sync** under **User Templates**.
+1. Copy `unraid/my-ListBridge.xml` to `/boot/config/plugins/dockerMan/templates-user/my-ListBridge.xml` on your Unraid server.
+2. In the Unraid WebGUI, go to **Docker** -> **Add Container** -> select **ListBridge** under **User Templates**.
 3. Fill in your credentials and click **Apply**.
