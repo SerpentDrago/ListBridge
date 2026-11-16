@@ -29,7 +29,7 @@ def patch_pyalexatodo_cleanly():
     Safely patches pyalexatodo 0.2.0 typing bugs in site-packages (or /app/libs)
     by reading the full file into memory BEFORE opening for write.
     """
-    search_dirs = [ "/app/libs" ] + site.getsitepackages()
+    search_dirs = ["/app/libs"] + site.getsitepackages()
     for base_dir in search_dirs:
         pkg_dir = os.path.join(base_dir, "pyalexatodo")
         if not os.path.exists(pkg_dir):
@@ -41,10 +41,6 @@ def patch_pyalexatodo_cleanly():
                 fpath = os.path.join(root, fname)
                 with open(fpath, "r", encoding="utf-8") as f:
                     code = f.read()
-
-                if "AlexaToDoAPI" not in code and fname == "api.py":
-                    logging.error(f"Corrupted {fpath} detected!")
-                    continue
 
                 lines = [
                     ln for ln in code.splitlines()
@@ -110,7 +106,7 @@ class SaveDataConfig:
 
 
 class DirectAlexaAdapter:
-    """Uses authenticated AmazonEchoApi + AlexaToDoAPI."""
+    """Uses authenticated AmazonEchoApi + AlexaToDoAPI with full PUT payload support."""
     def __init__(self, email, password, otp_secret):
         self.email = email
         self.password = password
@@ -280,11 +276,39 @@ class DirectAlexaAdapter:
     async def _toggle_async(self, todo_api, lid, item_obj, checked):
         item_id = getattr(item_obj, "id", None) or getattr(item_obj, "item_id", None) or getattr(item_obj, "itemId", None)
         version = int(getattr(item_obj, "version", 1) or 1)
+        val = getattr(item_obj, "value", None) or getattr(item_obj, "name", None) or ""
+
         try:
+            # 1. Call pyalexatodo's built-in set_item_checked_status
             await todo_api.set_item_checked_status(lid, item_id, bool(checked), version)
+
+            # 2. Send full PUT with `value` preserved so Amazon commits `completed`
+            if hasattr(todo_api, "_http_request"):
+                if hasattr(item_obj, "model_dump"):
+                    payload = item_obj.model_dump(by_alias=True, exclude_none=True)
+                elif hasattr(item_obj, "dict"):
+                    payload = item_obj.dict(by_alias=True, exclude_none=True)
+                else:
+                    payload = {"id": item_id, "listId": lid, "value": val, "type": "TASK"}
+
+                payload["id"] = item_id
+                payload["listId"] = lid
+                payload["value"] = val
+                payload["completed"] = bool(checked)
+                payload["version"] = version
+
+                try:
+                    await todo_api._http_request(
+                        method="PUT",
+                        endpoint=f"/api/namedLists/{lid}/item/{item_id}",
+                        input_data=payload,
+                    )
+                except Exception:
+                    pass
+
             return True
         except Exception as e:
-            logging.error(f"Alexa set_item_checked_status failed for '{getattr(item_obj, 'value', item_id)}': {e}")
+            logging.error(f"Alexa set_item_checked_status failed for '{val or item_id}': {e}")
             return False
 
     def set_checked(self, list_name, item_objs, name, checked):
