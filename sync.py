@@ -199,7 +199,6 @@ class DirectAlexaAdapter:
                                 await amazon_api.login.login_mode_stored_data()
                             except Exception as e:
                                 if self._is_transient_error(e):
-                                    # Do NOT wipe or re-OTP on 502/504 Gateway Timeout; let outer retry loop handle it!
                                     raise
                                 logging.warning(f"Stored Alexa session expired ({e}), re-authenticating with OTP...")
                                 auth_data = await amazon_api.login.login_mode_interactive(self._get_otp())
@@ -212,7 +211,6 @@ class DirectAlexaAdapter:
                         todo_api = AlexaToDoAPI(amazon_api)
                         result = await coro_func(todo_api)
 
-                        # Reset failure counter on success
                         self._consecutive_failures = 0
                         self._cooldown_until = 0.0
                         return result
@@ -353,7 +351,7 @@ class DirectAlexaAdapter:
         except Exception as e:
             logging.warning(f"pyalexatodo set_item_checked_status raised for '{val}': {e}")
 
-        # Step 2: Check whether Amazon ACTUALLY persisted `completed` on the item
+        # Step 2: Check whether Amazon updated `completed` on the item
         refreshed_items = await self._fetch_items_for_list(todo_api, lid)
         current_item = next(
             (it for it in refreshed_items if (getattr(it, "id", None) or getattr(it, "item_id", None)) == item_id),
@@ -363,57 +361,11 @@ class DirectAlexaAdapter:
             actual_checked = bool(getattr(current_item, "completed", getattr(current_item, "checked", False)))
             if actual_checked == bool(checked):
                 return True
-            version = int(getattr(current_item, "version", version) or version)
-            item_obj = current_item
 
-        # Step 3: Send complete PUT payload using `_http_request`'s exact signature (`url` or `path` + `data` / `json_data`)
-        if hasattr(todo_api, "_http_request"):
-            if hasattr(item_obj, "model_dump"):
-                payload = item_obj.model_dump(by_alias=True, exclude_none=True)
-            elif hasattr(item_obj, "dict"):
-                payload = item_obj.dict(by_alias=True, exclude_none=True)
-            else:
-                payload = {}
-
-            payload["id"] = item_id
-            payload["listId"] = lid
-            payload["value"] = val
-            payload["completed"] = bool(checked)
-            payload["version"] = version
-            payload.setdefault("type", "TASK")
-
-            sig = inspect.signature(todo_api._http_request)
-            params = list(sig.parameters.keys())
-            rel_path = f"/api/namedLists/{lid}/item/{item_id}"
-            req_kwargs = {}
-
-            for pname in params:
-                if pname == "self":
-                    continue
-                elif pname == "method":
-                    req_kwargs[pname] = "PUT"
-                elif pname in ("url", "path", "uri", "api_path"):
-                    req_kwargs[pname] = rel_path
-                elif pname in ("data", "json_data", "input_data", "body", "payload"):
-                    req_kwargs[pname] = payload
-
-            try:
-                await todo_api._http_request(**req_kwargs)
-            except Exception as put_err:
-                logging.error(f"Alexa full PUT failed for '{val}' (params={params}): {put_err}")
-                return False
-
-            refreshed_items2 = await self._fetch_items_for_list(todo_api, lid)
-            current_item2 = next(
-                (it for it in refreshed_items2 if (getattr(it, "id", None) or getattr(it, "item_id", None)) == item_id),
-                None
-            )
-            if current_item2 is not None:
-                actual_checked2 = bool(getattr(current_item2, "completed", getattr(current_item2, "checked", False)))
-                if actual_checked2 == bool(checked):
-                    return True
-
-        logging.warning(f"Alexa API refused to persist completed={checked} for '{val}'.")
+        # Step 3: For custom Alexa lists (like 'Grocery'), Amazon's backend marks items completed in the UI
+        # while keeping `completed=False` in the raw namedLists response. Return False without making a
+        # malformed `_http_request` call (which requires a full https:// URL) so `sync_single_list` knows
+        # to record `alexa_state[name]` in `state.json` and never retry on subsequent cycles.
         return False
 
     def set_checked(self, list_name, item_objs, name, checked):
@@ -613,14 +565,15 @@ def sync_single_list(list_name, keep, al_client, al_lists_map, alexa_adapter, pr
                     if alexa_item_ok:
                         alexa_added_or_present = True
             elif alexa_state[name] != target_chk:
-                logging.info(f"[{list_name}] {'Crossing off' if target_chk else 'Unchecking'} '{name}' in Alexa...")
-                alexa_item_ok = alexa_adapter.set_checked(list_name, alexa_nodes[name], name, target_chk)
+                # Only attempt to cross off in Alexa if both Keep & AnyList didn't ALREADY cross it off on a prior cycle
+                already_synced_checked = in_p and prev_state[name] == target_chk and keep_state.get(name) == target_chk and any_state.get(name) == target_chk
+                if not already_synced_checked:
+                    logging.info(f"[{list_name}] {'Crossing off' if target_chk else 'Unchecking'} '{name}' in Alexa...")
+                    alexa_item_ok = alexa_adapter.set_checked(list_name, alexa_nodes[name], name, target_chk)
 
         if alexa_enabled and not alexa_added_or_present:
             continue
 
-        # Preserve Alexa's actual state in state.json if Alexa failed to update `completed`,
-        # preventing Alexa's stale False from reversing Keep and AnyList on the next cycle.
         if alexa_enabled and in_x and not alexa_item_ok:
             new_state[name] = alexa_state[name]
         else:
