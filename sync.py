@@ -106,7 +106,7 @@ class SaveDataConfig:
 
 
 class DirectAlexaAdapter:
-    """Uses authenticated AmazonEchoApi + AlexaToDoAPI with verified completion persistence."""
+    """Uses authenticated AmazonEchoApi + AlexaToDoAPI with exponential retry backoff and outage cooldown."""
     def __init__(self, email, password, otp_secret):
         self.email = email
         self.password = password
@@ -114,6 +114,8 @@ class DirectAlexaAdapter:
         self.lists_cache = {}
         self._cycle_data = {}
         self._logged_lists_once = False
+        self._cooldown_until = 0.0
+        self._consecutive_failures = 0
 
     def _get_otp(self):
         if not self.otp_secret:
@@ -138,47 +140,107 @@ class DirectAlexaAdapter:
             with open(ALEXA_AUTH_FILE, "w") as f:
                 json.dump(data, f)
 
+    def _is_transient_error(self, err):
+        msg = str(err).lower()
+        transient_markers = (
+            "gateway timeout",
+            "bad gateway",
+            "service unavailable",
+            "too many requests",
+            "502",
+            "503",
+            "504",
+            "429",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "cannot connect",
+            "server disconnected",
+        )
+        return any(m in msg for m in transient_markers)
+
     async def _run_with_todo_api(self, coro_func):
-        async with ClientSession() as session:
-            stored_data = self._load_auth()
-            sig = inspect.signature(AmazonEchoApi.__init__)
+        now = time.time()
+        if now < self._cooldown_until:
+            remaining = int(self._cooldown_until - now)
+            raise RuntimeError(f"Alexa API in outage cooldown ({remaining}s remaining)")
 
-            kwargs = {}
-            for pname, param in sig.parameters.items():
-                if pname == "self":
-                    continue
-                elif pname == "client_session":
-                    kwargs[pname] = session
-                elif pname == "login_email":
-                    kwargs[pname] = self.email
-                elif pname == "login_password":
-                    kwargs[pname] = self.password
-                elif pname == "login_data":
-                    kwargs[pname] = stored_data
-                elif pname == "save_data":
-                    kwargs[pname] = SaveDataConfig(path=DATA_DIR, callback=None)
-                elif param.default is inspect.Parameter.empty:
-                    kwargs[pname] = None
+        max_attempts = 3
+        backoff_delays = [2, 4, 8]
+        last_err = None
 
-            amazon_api = AmazonEchoApi(**kwargs)
+        for attempt in range(max_attempts):
             try:
-                if stored_data:
-                    try:
-                        await amazon_api.login.login_mode_stored_data()
-                    except Exception as e:
-                        logging.warning(f"Stored Alexa session expired ({e}), re-authenticating with OTP...")
-                        auth_data = await amazon_api.login.login_mode_interactive(self._get_otp())
-                        self._save_auth(auth_data)
-                else:
-                    logging.info("Performing initial Alexa login with OTP secret...")
-                    auth_data = await amazon_api.login.login_mode_interactive(self._get_otp())
-                    self._save_auth(auth_data)
+                async with ClientSession() as session:
+                    stored_data = self._load_auth()
+                    sig = inspect.signature(AmazonEchoApi.__init__)
 
-                todo_api = AlexaToDoAPI(amazon_api)
-                return await coro_func(todo_api)
-            finally:
-                if hasattr(amazon_api, "close"):
-                    await amazon_api.close()
+                    kwargs = {}
+                    for pname, param in sig.parameters.items():
+                        if pname == "self":
+                            continue
+                        elif pname == "client_session":
+                            kwargs[pname] = session
+                        elif pname == "login_email":
+                            kwargs[pname] = self.email
+                        elif pname == "login_password":
+                            kwargs[pname] = self.password
+                        elif pname == "login_data":
+                            kwargs[pname] = stored_data
+                        elif pname == "save_data":
+                            kwargs[pname] = SaveDataConfig(path=DATA_DIR, callback=None)
+                        elif param.default is inspect.Parameter.empty:
+                            kwargs[pname] = None
+
+                    amazon_api = AmazonEchoApi(**kwargs)
+                    try:
+                        if stored_data:
+                            try:
+                                await amazon_api.login.login_mode_stored_data()
+                            except Exception as e:
+                                if self._is_transient_error(e):
+                                    # Do NOT wipe or re-OTP on 502/504 Gateway Timeout; let outer retry loop handle it!
+                                    raise
+                                logging.warning(f"Stored Alexa session expired ({e}), re-authenticating with OTP...")
+                                auth_data = await amazon_api.login.login_mode_interactive(self._get_otp())
+                                self._save_auth(auth_data)
+                        else:
+                            logging.info("Performing initial Alexa login with OTP secret...")
+                            auth_data = await amazon_api.login.login_mode_interactive(self._get_otp())
+                            self._save_auth(auth_data)
+
+                        todo_api = AlexaToDoAPI(amazon_api)
+                        result = await coro_func(todo_api)
+
+                        # Reset failure counter on success
+                        self._consecutive_failures = 0
+                        self._cooldown_until = 0.0
+                        return result
+                    finally:
+                        if hasattr(amazon_api, "close"):
+                            await amazon_api.close()
+
+            except Exception as err:
+                last_err = err
+                if self._is_transient_error(err) and attempt < max_attempts - 1:
+                    delay = backoff_delays[attempt]
+                    logging.warning(
+                        f"Transient Amazon API error ({err}). Retrying in {delay}s "
+                        f"(attempt {attempt + 1}/{max_attempts})..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                break
+
+        self._consecutive_failures += 1
+        if self._is_transient_error(last_err) and self._consecutive_failures >= 2:
+            cooldown_sec = 300
+            self._cooldown_until = time.time() + cooldown_sec
+            logging.warning(
+                f"Amazon Alexa API appears temporarily unavailable ({last_err}). "
+                f"Entering {cooldown_sec}s cooldown (AnyList & Google Keep will continue syncing)."
+            )
+        raise last_err
 
     def _resolve_list_id(self, list_name):
         target = ALEXA_LIST_MAP.get(list_name, list_name).strip().lower()
@@ -274,20 +336,24 @@ class DirectAlexaAdapter:
             except Exception as e:
                 logging.error(f"[{list_name}] Alexa add_item failed for '{name}': {e}\n{traceback.format_exc()}")
                 return False
-        return bool(asyncio.run(self._run_with_todo_api(_add)))
+        try:
+            return bool(asyncio.run(self._run_with_todo_api(_add)))
+        except Exception as e:
+            logging.warning(f"[{list_name}] Skipping Alexa add for '{name}': {e}")
+            return False
 
     async def _toggle_async(self, todo_api, lid, item_obj, checked):
         item_id = getattr(item_obj, "id", None) or getattr(item_obj, "item_id", None) or getattr(item_obj, "itemId", None)
         version = int(getattr(item_obj, "version", 1) or 1)
         val = getattr(item_obj, "value", None) or getattr(item_obj, "name", None) or ""
 
-        # Step 1: Try pyalexatodo's built-in set_item_checked_status
+        # Step 1: Call pyalexatodo's built-in set_item_checked_status
         try:
             await todo_api.set_item_checked_status(lid, item_id, bool(checked), version)
         except Exception as e:
             logging.warning(f"pyalexatodo set_item_checked_status raised for '{val}': {e}")
 
-        # Step 2: Check whether Amazon ACTUALLY updated `completed` on the item
+        # Step 2: Check whether Amazon ACTUALLY persisted `completed` on the item
         refreshed_items = await self._fetch_items_for_list(todo_api, lid)
         current_item = next(
             (it for it in refreshed_items if (getattr(it, "id", None) or getattr(it, "item_id", None)) == item_id),
@@ -300,7 +366,7 @@ class DirectAlexaAdapter:
             version = int(getattr(current_item, "version", version) or version)
             item_obj = current_item
 
-        # Step 3: Send complete PUT payload with `value`, `completed`, `listId`, `id`, `version`, and `type`
+        # Step 3: Send complete PUT payload using `_http_request`'s exact signature (`url` or `path` + `data` / `json_data`)
         if hasattr(todo_api, "_http_request"):
             if hasattr(item_obj, "model_dump"):
                 payload = item_obj.model_dump(by_alias=True, exclude_none=True)
@@ -317,18 +383,24 @@ class DirectAlexaAdapter:
             payload.setdefault("type", "TASK")
 
             sig = inspect.signature(todo_api._http_request)
-            req_kwargs = {"method": "PUT", "endpoint": f"/api/namedLists/{lid}/item/{item_id}"}
-            if "data" in sig.parameters:
-                req_kwargs["data"] = payload
-            elif "json_data" in sig.parameters:
-                req_kwargs["json_data"] = payload
-            elif "input_data" in sig.parameters:
-                req_kwargs["input_data"] = payload
+            params = list(sig.parameters.keys())
+            rel_path = f"/api/namedLists/{lid}/item/{item_id}"
+            req_kwargs = {}
+
+            for pname in params:
+                if pname == "self":
+                    continue
+                elif pname == "method":
+                    req_kwargs[pname] = "PUT"
+                elif pname in ("url", "path", "uri", "api_path"):
+                    req_kwargs[pname] = rel_path
+                elif pname in ("data", "json_data", "input_data", "body", "payload"):
+                    req_kwargs[pname] = payload
 
             try:
                 await todo_api._http_request(**req_kwargs)
             except Exception as put_err:
-                logging.error(f"Alexa full PUT failed for '{val}': {put_err}")
+                logging.error(f"Alexa full PUT failed for '{val}' (params={params}): {put_err}")
                 return False
 
             refreshed_items2 = await self._fetch_items_for_list(todo_api, lid)
@@ -341,7 +413,7 @@ class DirectAlexaAdapter:
                 if actual_checked2 == bool(checked):
                     return True
 
-        logging.warning(f"Alexa API refused to persist completed={checked} for '{val}'. Preserving state to prevent ping-pong.")
+        logging.warning(f"Alexa API refused to persist completed={checked} for '{val}'.")
         return False
 
     def set_checked(self, list_name, item_objs, name, checked):
@@ -354,7 +426,11 @@ class DirectAlexaAdapter:
                 if not ok:
                     all_ok = False
             return all_ok
-        return bool(asyncio.run(self._run_with_todo_api(_check)))
+        try:
+            return bool(asyncio.run(self._run_with_todo_api(_check)))
+        except Exception as e:
+            logging.warning(f"[{list_name}] Skipping Alexa check update for '{name}': {e}")
+            return False
 
     def delete_item(self, list_name, item_objs, name):
         lid = self._resolve_list_id(list_name)
@@ -370,7 +446,11 @@ class DirectAlexaAdapter:
                     logging.error(f"Alexa delete_item failed for '{name}': {e}")
                     all_ok = False
             return all_ok
-        return bool(asyncio.run(self._run_with_todo_api(_del)))
+        try:
+            return bool(asyncio.run(self._run_with_todo_api(_del)))
+        except Exception as e:
+            logging.warning(f"[{list_name}] Skipping Alexa delete for '{name}': {e}")
+            return False
 
 
 def load_all_states():
@@ -539,7 +619,12 @@ def sync_single_list(list_name, keep, al_client, al_lists_map, alexa_adapter, pr
         if alexa_enabled and not alexa_added_or_present:
             continue
 
-        new_state[name] = target_chk
+        # Preserve Alexa's actual state in state.json if Alexa failed to update `completed`,
+        # preventing Alexa's stale False from reversing Keep and AnyList on the next cycle.
+        if alexa_enabled and in_x and not alexa_item_ok:
+            new_state[name] = alexa_state[name]
+        else:
+            new_state[name] = target_chk
 
     return new_state, keep_changed, (alexa_was_initialized or alexa_enabled)
 
@@ -565,10 +650,11 @@ def main():
             al_lists_map = {l.name.strip(): l for l in al_lists}
 
             if alexa_adapter:
+                alexa_adapter._cycle_data = {}
                 try:
                     alexa_adapter.refresh_lists_and_items(LIST_NAMES)
                 except Exception as alexa_err:
-                    logging.error(f"Alexa fetch failed (Keep & AnyList will still sync): {alexa_err}\n{traceback.format_exc()}")
+                    logging.warning(f"Alexa fetch skipped this cycle (Keep & AnyList will still sync): {alexa_err}")
 
             all_states, alexa_init = load_all_states()
             any_keep_changes = False
