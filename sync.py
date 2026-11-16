@@ -345,28 +345,12 @@ class DirectAlexaAdapter:
         version = int(getattr(item_obj, "version", 1) or 1)
         val = getattr(item_obj, "value", None) or getattr(item_obj, "name", None) or ""
 
-        # Step 1: Call pyalexatodo's built-in set_item_checked_status
         try:
             await todo_api.set_item_checked_status(lid, item_id, bool(checked), version)
+            return True
         except Exception as e:
             logging.warning(f"pyalexatodo set_item_checked_status raised for '{val}': {e}")
-
-        # Step 2: Check whether Amazon updated `completed` on the item
-        refreshed_items = await self._fetch_items_for_list(todo_api, lid)
-        current_item = next(
-            (it for it in refreshed_items if (getattr(it, "id", None) or getattr(it, "item_id", None)) == item_id),
-            None
-        )
-        if current_item is not None:
-            actual_checked = bool(getattr(current_item, "completed", getattr(current_item, "checked", False)))
-            if actual_checked == bool(checked):
-                return True
-
-        # Step 3: For custom Alexa lists (like 'Grocery'), Amazon's backend marks items completed in the UI
-        # while keeping `completed=False` in the raw namedLists response. Return False without making a
-        # malformed `_http_request` call (which requires a full https:// URL) so `sync_single_list` knows
-        # to record `alexa_state[name]` in `state.json` and never retry on subsequent cycles.
-        return False
+            return False
 
     def set_checked(self, list_name, item_objs, name, checked):
         lid = self._resolve_list_id(list_name)
@@ -565,19 +549,17 @@ def sync_single_list(list_name, keep, al_client, al_lists_map, alexa_adapter, pr
                     if alexa_item_ok:
                         alexa_added_or_present = True
             elif alexa_state[name] != target_chk:
-                # Only attempt to cross off in Alexa if both Keep & AnyList didn't ALREADY cross it off on a prior cycle
-                already_synced_checked = in_p and prev_state[name] == target_chk and keep_state.get(name) == target_chk and any_state.get(name) == target_chk
-                if not already_synced_checked:
+                # Only push to Alexa when target_chk actually changed since last cycle
+                # (prevents repeating check-offs every minute when Alexa's raw API lags behind its UI)
+                state_changed_this_cycle = (not in_p) or (prev_state[name] != target_chk)
+                if state_changed_this_cycle:
                     logging.info(f"[{list_name}] {'Crossing off' if target_chk else 'Unchecking'} '{name}' in Alexa...")
                     alexa_item_ok = alexa_adapter.set_checked(list_name, alexa_nodes[name], name, target_chk)
 
         if alexa_enabled and not alexa_added_or_present:
             continue
 
-        if alexa_enabled and in_x and not alexa_item_ok:
-            new_state[name] = alexa_state[name]
-        else:
-            new_state[name] = target_chk
+        new_state[name] = target_chk
 
     return new_state, keep_changed, (alexa_was_initialized or alexa_enabled)
 
