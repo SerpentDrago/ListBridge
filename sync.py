@@ -105,6 +105,20 @@ class SaveDataConfig:
         self.enabled = False
 
 
+def is_alexa_item_checked(item):
+    if hasattr(item, "is_checked"):
+        return bool(item.is_checked)
+    status = getattr(item, "status", None)
+    if status is not None:
+        status_val = getattr(status, "value", status)
+        if str(status_val).upper() == "COMPLETE":
+            return True
+    for attr in ("completed", "checked", "complete"):
+        if hasattr(item, attr):
+            return bool(getattr(item, attr))
+    return False
+
+
 class DirectAlexaAdapter:
     """Uses authenticated AmazonEchoApi + AlexaToDoAPI with exponential retry backoff and outage cooldown."""
     def __init__(self, email, password, otp_secret):
@@ -307,7 +321,7 @@ class DirectAlexaAdapter:
                     val = (getattr(item, "value", None) or getattr(item, "name", None) or getattr(item, "text", None) or "").strip()
                     if not val:
                         continue
-                    checked = bool(getattr(item, "completed", getattr(item, "checked", False)))
+                    checked = is_alexa_item_checked(item)
                     nodes.setdefault(val, []).append(item)
                     if val not in state or not checked:
                         state[val] = checked
@@ -358,6 +372,8 @@ class DirectAlexaAdapter:
         async def _check(todo_api):
             all_ok = True
             for obj in objs:
+                if is_alexa_item_checked(obj) == bool(checked):
+                    continue
                 ok = await self._toggle_async(todo_api, lid, obj, checked)
                 if not ok:
                     all_ok = False
@@ -548,18 +564,17 @@ def sync_single_list(list_name, keep, al_client, al_lists_map, alexa_adapter, pr
                     alexa_item_ok = alexa_adapter.add_item(list_name, name, target_chk)
                     if alexa_item_ok:
                         alexa_added_or_present = True
-            elif alexa_state[name] != target_chk:
-                # Only push to Alexa when target_chk actually changed since last cycle
-                # (prevents repeating check-offs every minute when Alexa's raw API lags behind its UI)
-                state_changed_this_cycle = (not in_p) or (prev_state[name] != target_chk)
-                if state_changed_this_cycle:
-                    logging.info(f"[{list_name}] {'Crossing off' if target_chk else 'Unchecking'} '{name}' in Alexa...")
-                    alexa_item_ok = alexa_adapter.set_checked(list_name, alexa_nodes[name], name, target_chk)
+            elif any(is_alexa_item_checked(node) != target_chk for node in alexa_nodes[name]):
+                logging.info(f"[{list_name}] {'Crossing off' if target_chk else 'Unchecking'} '{name}' in Alexa...")
+                alexa_item_ok = alexa_adapter.set_checked(list_name, alexa_nodes[name], name, target_chk)
 
         if alexa_enabled and not alexa_added_or_present:
             continue
 
-        new_state[name] = target_chk
+        if alexa_enabled and in_x and not alexa_item_ok:
+            new_state[name] = alexa_state[name]
+        else:
+            new_state[name] = target_chk
 
     return new_state, keep_changed, (alexa_was_initialized or alexa_enabled)
 
